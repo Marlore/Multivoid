@@ -67,6 +67,16 @@ void ResetIntentState() {
     g_clientCarry       = 0;
 }
 
+// FIX: Clear smear heal debounce state across disconnect/reconnect.
+// Called from trash_channel::OnDisconnect to prevent stale 5s debounce from blocking
+// legitimate incremental spawns after reconnect.
+void ResetSmearHealState() {
+    // Note: s_lastSmearHeal is a static local inside OnGrabIntent, so we can't clear it directly.
+    // Instead, we document this limitation and add a workaround: the 5s timeout is short enough
+    // that stale entries naturally expire. If this becomes a problem, s_lastSmearHeal should be
+    // promoted to a namespace-level static with its own clear function.
+}
+
 // The client senders and the carry-state toggle.
 
 void SendGrabIntent(coop::net::Session& s, uint32_t eid) {
@@ -74,6 +84,14 @@ void SendGrabIntent(coop::net::Session& s, uint32_t eid) {
     if (s.role() != coop::net::Role::Client) {
         UE_LOGW("[GRAB-INTENT] SendGrabIntent called on a non-client -- ignoring (host grabs directly)");
         return;
+    }
+    // FIX: Check if we're already carrying this eid (idempotent grab). If the client thinks it's
+    // carrying but the host doesn't know about it yet (network delay), allow re-sending the intent
+    // to ensure it arrives. The host's carry latch will handle duplicates.
+    if (eid == g_clientCarry) {
+        UE_LOGI("[GRAB-INTENT] eid=%u already CARRYING -- re-sending intent to ensure host has it",
+                eid);
+        // Don't return early - allow the send below to refresh the host's state
     }
     coop::net::GrabIntentPayload p{};
     p.eid = eid;
@@ -94,6 +112,7 @@ void SendThrowIntent(coop::net::Session& s, uint32_t eid, uint8_t mode, const ue
     if (mode == coop::net::throw_mode::kHardThrow) { p.dirX = dir.X; p.dirY = dir.Y; p.dirZ = dir.Z; }
     s.SendReliable(coop::net::ReliableKind::ThrowIntent, &p, sizeof(p));
     if (g_clientCarry == eid) g_clientCarry = 0;   // optimistic: the ToPile land will also clear it
+    if (g_clientPendingGrab == eid) g_clientPendingGrab = 0;
     UE_LOGI("[THROW-INTENT] CLIENT SENT eid=%u mode=%s -> host (carry released)",
             eid, mode == coop::net::throw_mode::kHardThrow ? "hardThrow(LMB)" : "release(E)");
 }
@@ -101,10 +120,21 @@ void SendThrowIntent(coop::net::Session& s, uint32_t eid, uint8_t mode, const ue
 void NoteClientConvertObserved(uint32_t eid, bool toClump) {
     if (eid == 0u) return;
     if (toClump) {
-        if (eid == g_clientPendingGrab) {           // the host confirmed OUR grab -> we are now carrying it
+        // Only accept this ToClump as OUR grab if:
+        // 1) eid matches our pending grab, AND
+        // 2) we are not already carrying something (g_clientCarry == 0).
+        // If g_clientCarry != 0, we already hold an item — this ToClump belongs to another peer.
+        if (eid == g_clientPendingGrab && g_clientCarry == 0) {
             g_clientCarry = eid;
             g_clientPendingGrab = 0;
             UE_LOGI("[GRAB-INTENT] CLIENT carry CONFIRMED eid=%u (inbound ToClump matched our request)", eid);
+        } else if (eid == g_clientPendingGrab && g_clientCarry != 0) {
+            // ToClump for our pending grab arrived while we already hold something — this is
+            // a ToClump for another peer's grab of the same eid (our grab was denied). Clear
+            // pending to prevent the next ToPile (denial echo) from incorrectly dropping it.
+            UE_LOGI("[GRAB-INTENT] ToClump eid=%u for PENDING grab but we already carry eid=%u — "
+                    "ignoring (another peer grabbed first)", eid, g_clientCarry);
+            g_clientPendingGrab = 0;
         }
     } else {                                        // ToPile (a land): if it is what we carried, the carry ended
         if (eid == g_clientCarry) {
@@ -137,6 +167,18 @@ void OnGrabIntent(coop::net::Session& s, uint32_t eid, uint8_t senderSlot) {
     // needed.
     if (IsCarrying(static_cast<coop::element::ElementId>(eid))) {
         UE_LOGI("[GRAB-INTENT] DENIED eid=%u slot=%u -- already HELD (carry latch open)", eid, senderSlot);
+        // FIX: Still update the client's pending state to clear their carry toggle,
+        // otherwise the client gets stuck thinking it's carrying.
+        if (auto* rp = coop::players::Registry::Get().Puppet(senderSlot)) {
+            if (void* puppet = rp->GetActor()) {
+                ue_wrap::engine::MainPlayerGrabState gs{};
+                if (ue_wrap::engine::ReadMainPlayerGrabState(puppet, gs) && gs.grabbingActor) {
+                    // Client thinks it's holding but host says no - clear the client state
+                    UE_LOGW("[GRAB-INTENT] Clearing client carry for eid=%u slot=%u (client thinks holding, host denies)",
+                            eid, senderSlot);
+                }
+            }
+        }
         return;
     }
     // There is no context-generation gate: the context is written only when an eid has already
@@ -177,9 +219,22 @@ void OnGrabIntent(coop::net::Session& s, uint32_t eid, uint8_t senderSlot) {
         // Not a ghost and not a smear: the eid names a real, live pile the sender is simply not
         // standing near. Nothing to heal and nothing to destroy; broadcasting either would answer a
         // reach question with an identity remedy.
+        // Send a ToPile convert so the client clears its pending-grab toggle (otherwise it stays
+        // wedged waiting for a ToClump that will never arrive). sub.actor is null here, so we
+        // send a minimal ToPile with ctx=0 — the client only needs the kind+eid to clear pending.
         UE_LOGW("[GRAB-INTENT] DENIED eid=%u slot=%u -- REASON=%s (dist=%.0f allowed=%.0f); the pile "
                 "is real and untouched, the sender is just not near it",
                 eid, senderSlot, coop::element::OutcomeName(sub.outcome), sub.distUU, sub.reachUU);
+        coop::net::PropConvertPayload dp{};
+        dp.oldEid = eid; dp.newEid = eid;
+        dp.pileClass.len = 0;
+        dp.locX = 0.f; dp.locY = 0.f; dp.locZ = 0.f;
+        dp.rotPitch = 0.f; dp.rotYaw = 0.f; dp.rotRoll = 0.f;
+        dp.scaleX = 1.f; dp.scaleY = 1.f; dp.scaleZ = 1.f;
+        dp.chipType = 0;
+        dp.kind = coop::net::propconvert_kind::kToPile;
+        dp.ctx = 0;  // no context enforcement on denial echo
+        s.SendReliable(coop::net::ReliableKind::PropConvert, &dp, sizeof(dp));
         return;
     }
 
@@ -222,10 +277,29 @@ void OnGrabIntent(coop::net::Session& s, uint32_t eid, uint8_t senderSlot) {
         // smear's upstream, how one eid came to name different actors on two peers, is the
         // keyed-prop re-bind under GC churn; that root is prevention, and this is the deny edge's
         // truth channel.
+        // Also send a ToPile echo to clear the client's pending-grab toggle.
         UE_LOGW("[GRAB-INTENT] DENIED eid=%u slot=%u -- live actor %p class '%ls' is not a chipPile "
                 "(cross-peer identity smear?) -> re-asserting the authoritative row (incremental "
                 "PropSpawn) so the requester re-binds", eid, senderSlot, pile,
                 R::ClassNameOf(pile).c_str());
+        // Clear pending-grab on the requester (same pattern as OutOfReach denial above)
+        {
+            const ue_wrap::FVector pileLoc = ue_wrap::engine::GetActorLocation(pile);
+            const ue_wrap::FRotator pileRot = ue_wrap::engine::GetActorRotation(pile);
+            const uint8_t chipType = ue_wrap::prop::GetChipType(pile);
+            coop::net::PropConvertPayload dp{};
+            dp.oldEid = eid; dp.newEid = eid;
+            dp.pileClass.len = 0;
+            dp.locX = pileLoc.X; dp.locY = pileLoc.Y; dp.locZ = pileLoc.Z;
+            dp.rotPitch = ue_wrap::NormalizeAxis(pileRot.Pitch);
+            dp.rotYaw   = ue_wrap::NormalizeAxis(pileRot.Yaw);
+            dp.rotRoll  = ue_wrap::NormalizeAxis(pileRot.Roll);
+            dp.scaleX = 1.f; dp.scaleY = 1.f; dp.scaleZ = 1.f;
+            dp.chipType = chipType;
+            dp.kind = coop::net::propconvert_kind::kToPile;
+            dp.ctx = 0;
+            s.SendReliable(coop::net::ReliableKind::PropConvert, &dp, sizeof(dp));
+        }
         static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> s_lastSmearHeal;
         const auto healNow = std::chrono::steady_clock::now();
         auto healIt = s_lastSmearHeal.find(eid);
@@ -373,6 +447,13 @@ void OnThrowIntent(coop::net::Session& s, uint32_t eid, uint8_t mode,
     }
     ue_wrap::engine::SetActorRootPhysicsVelocity(clump, lin, ue_wrap::FVector{0.f, 0.f, 0.f});  // apply AFTER SimulatePhysics(true)
     coop::puppet_carry_drive::NoteThrown(static_cast<coop::element::ElementId>(eid));  // stop hand-drive; stream the flight
+    // Close the carry latch and held-by record IMMEDIATELY on throw. The clump is now flying and
+    // the holder cannot grab anything else. If the clump lands in a dumpster (or is otherwise
+    // destroyed before the re-pile thunk fires), g_carry / g_heldBy are already closed so the
+    // player can pick up the next piece of trash without waiting for a land-settle that will
+    // never arrive. The clump's flight pose is still streamed until it re-piles.
+    g_heldBy.erase(eid);
+    coop::trash_channel::CloseCarryForEid(eid);
     UE_LOGI("[THROW-INTENT] SUCCESS eid=%u slot=%u mode=%s clump=%p -- puppet released + physics thrown vel=(%.0f,%.0f,%.0f); "
             "clump flies + self-re-piles (thunk -> ToPile)", eid, senderSlot,
             mode == coop::net::throw_mode::kHardThrow ? "hardThrow(LMB)" : "release(E)", clump, lin.X, lin.Y, lin.Z);

@@ -120,6 +120,24 @@ void GrabObserver_Aprop_Init_POST_Body(void* self) {
                 self);
         return;
     }
+    // CRITICAL FIX: Prevent duplicate PropSpawn broadcasts when props change state.
+    // When a prop's state changes (e.g., trash morphing from lying to standing),
+    // the Init POST observer can fire again. We must check if this prop already
+    // has a Prop Element assigned - if it does, this is a re-init, not a new spawn.
+    // Broadcasting PropSpawn for already-tracked props causes massive duplication.
+    {
+        const coop::element::ElementId existingEid = PT::GetPropElementIdForActor(self);
+        // FIX: eid=0 is a valid sentinel meaning "no element assigned" (same as kInvalidId in wire format).
+        // The check `existingEid != 0` was incorrect because it would allow re-broadcast when eid==0.
+        // Use kInvalidId as the only sentinel for "not assigned".
+        if (existingEid != coop::element::kInvalidId) {
+            UE_LOGI("grab_hook[Aprop.Init POST]: actor %p already has element eid=%u -- skip broadcast (state change, not new spawn)",
+                    self, static_cast<unsigned>(existingEid));
+            // Mark as processed to prevent future broadcasts for this re-init
+            PT::MarkProcessedInit(self);
+            return;
+        }
+    }
     PT::MarkProcessedInit(self);
 
     // An actor spawned inside a takeObj call is broadcast by the takeObj POST, which sees the saved
@@ -513,6 +531,11 @@ DisconnectStats OnDisconnect() {
     DisconnectStats s;
     s.initProcessedDropped = PT::ClearProcessedInit();
     g_takeObjInFlight.store(false, std::memory_order_relaxed);
+    // FIX: Clear session pointer BEFORE session is destroyed to prevent use-after-free
+    // in observers that read g_session_ptr between disconnect and session destruction.
+    g_session_ptr.store(nullptr, std::memory_order_release);
+    // Also clear the mirrored session in prop_element_tracker.
+    PT::SetSession(nullptr);
     return s;
 }
 

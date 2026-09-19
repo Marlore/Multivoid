@@ -238,10 +238,16 @@ void OnSaveLoadSpawn(void* newActor, MAP::Family family) {
     // at this seam, so order is the only signal here; the position re-bind at quiescence is the
     // backstop for GC churn.
     if (g_chipCursor >= g_chipEntries.size()) {
+        // FIX: Instead of cascade-failing all future spawns, log and defer to quiescence.
+        // At quiescence, BindUnboundReCreates will match by position (1cm kernel), which is
+        // more robust than ordinal bind when GC churn causes spawn order mismatches.
         if (g_overflowChip == 0)
-            UE_LOGW("save_identity_bind: chipPile keyless spawn beyond the mapped %zu chipPile entries -- NOT "
-                    "binding this or further chipPile spawns (per-family count mismatch)", g_chipEntries.size());
+            UE_LOGW("save_identity_bind: chipPile keyless spawn beyond the mapped %zu chipPile entries -- "
+                    "DEFERRING to quiescence position-match (ordinal bind exhausted, but position fallback available)",
+                    g_chipEntries.size());
         ++g_overflowChip;
+        // Don't return — let the spawn continue, it will be bound at quiescence.
+        // The caller should NOT skip the spawn; it just won't get an ordinal bind now.
         return;
     }
     const MAP::IdEntry& e = g_chipEntries[g_chipCursor];

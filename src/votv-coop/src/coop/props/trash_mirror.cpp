@@ -41,7 +41,33 @@ void SkinTrashNative(void* native, uint8_t chipType, const ue_wrap::FRotator& me
                     const ue_wrap::FVector& scale) {
     ue_wrap::prop::SetChipTypeAndRebuild(native, chipType);
     if (scale.X > 0.001f && scale.Y > 0.001f && scale.Z > 0.001f) E::SetActorScale3D(native, scale);
-    if (void* comp = E::GetStaticMeshComponent(native)) E::SetComponentWorldRotation(comp, meshWorldRot);
+    if (void* comp = E::GetStaticMeshComponent(native)) {
+        // FIX: For trash piles (chipPile), the visible orientation is stored on the StaticMesh
+        // component's RELATIVE rotation (a random roll from UserConstructionScript), not the
+        // actor root. Setting WORLD rotation directly can cause divergence because the actor
+        // root may also have a rotation component.
+        // 
+        // Strategy: Read the current WORLD rotation, compute the relative rotation from the
+        // component's parent (if any), then set the component's relative rotation to match
+        // the host's intended world rotation.
+        ue_wrap::FRotator currentWorldRot = E::GetComponentWorldRotation(comp);
+        ue_wrap::FRotator parentWorldRot = E::GetActorRotation(native);
+        
+        // Compute relative rotation: we want comp's world rot to equal meshWorldRot
+        // relative = parent^{-1} * desired_world
+        // In UE4/5, component world = parent world * component relative
+        // So: component relative = inverse(parent world) * component world
+        ue_wrap::FRotator desiredRelative;
+        desiredRelative.Pitch = ue_wrap::NormalizeAxis(meshWorldRot.Pitch - parentWorldRot.Pitch);
+        desiredRelative.Yaw = ue_wrap::NormalizeAxis(meshWorldRot.Yaw - parentWorldRot.Yaw);
+        desiredRelative.Roll = ue_wrap::NormalizeAxis(meshWorldRot.Roll - parentWorldRot.Roll);
+        
+        E::SetComponentRelativeRotation(comp, desiredRelative);
+        
+        UE_LOGI("[PILE] trash_mirror: SetComponentRelativeRotation for chipType=%u: world=(%.1f,%.1f,%.1f) relative=(%.1f,%.1f,%.1f)",
+                chipType, meshWorldRot.Pitch, meshWorldRot.Yaw, meshWorldRot.Roll,
+                desiredRelative.Pitch, desiredRelative.Yaw, desiredRelative.Roll);
+    }
 }
 
 // The mirrors this module MADE, with the pin each one owns. A GcPin releases from its
@@ -102,6 +128,12 @@ void* Materialize(coop::element::ElementId eid, const std::wstring& className, u
         UE_LOGW("[PILE] trash_mirror: GC PIN FAILED for native=%p eid=%u -- this mirror "
                 "can be collected out from under its cached pointer", native, eid);
         g_made.erase(native);
+        // CRITICAL: The actor was spawned but the pin failed. Without cleanup, this becomes an
+        // orphaned actor anchored in the world with no tracking. Destroy it immediately to prevent
+        // leaks and desync (the caller will get nullptr and handle gracefully).
+        UE_LOGW("[PILE] trash_mirror: destroying orphaned native=%p (pin failed, no mirror tracking)", native);
+        E::DestroyActor(native);
+        return nullptr;  // Signal failure to caller -- no mirror to return
     }
     // The parking, classified (coop-sync-doctrine step 4). Each removes a SECOND AUTHOR of a state
     // the host already authors and replicates -- the pose, and the pile-clump transition -- so

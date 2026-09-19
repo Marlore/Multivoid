@@ -107,6 +107,20 @@ bool ReadLocalPose(void* local, void* controller, coop::net::PoseSnapshot& out) 
             out.stateBits |= coop::net::kStateBitRagdoll;
         }
     }
+    // The crouch bit: the source halves its capsule half-height when crouching; we detect it by
+    // comparing the current half-height to a latched standing reference. The puppet uses this bit
+    // to scale its capsule height so the AnimBP plays the correct jump animation.
+    {
+        static float sStandingHalfHeight = 0.f;
+        const float curH = ue_wrap::engine::GetActorCharacterHalfHeight(local);
+        if (sStandingHalfHeight <= 0.f) {
+            // First read: capture the standing height (player is not crouching at session start).
+            sStandingHalfHeight = curH;
+        }
+        if (sStandingHalfHeight > 0.f && curH < sStandingHalfHeight * 0.6f) {
+            out.stateBits |= coop::net::kStateBitCrouch;
+        }
+    }
     // The vitals (health fraction, food, sleep) in three bytes: ue_wrap::vitals reads this
     // machine's UsaveSlot_C, so each peer packs its own. Full (255) until the save resolves, so a
     // booting peer does not flash an empty bar; the receiver treats them as display only. O(1)

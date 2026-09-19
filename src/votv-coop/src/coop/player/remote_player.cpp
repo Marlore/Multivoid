@@ -396,6 +396,7 @@ void RemotePlayer::Destroy() {
     hurtFlashActive_ = false;
     hurtSavedMaterials_.clear(); // the mesh died with the actor -- no restore needed, drop stale ptrs
     appliedSkin_.clear();        // the next Spawn re-applies from SkinForSlot
+    standingCapsuleHalfHeight_ = 0.f;  // reset so the next Spawn captures the fresh value
     UE_LOGI("RemotePlayer::Destroy: puppet + nameplate gone");
 }
 
@@ -499,6 +500,15 @@ void RemotePlayer::ApplyToEngine() {
         // stride emitter's run boundary.
         Pup::DriveSprintWalkSpeed(
             actor_, curSpeed_ > coop::puppet_footsteps::Stride::kRunSpeedCmS);
+        // Crouch: halve the capsule half-height when the crouching bit is set, so the AnimBP
+        // plays the correct jump animation (crouch jump vs regular jump). The standing height
+        // is captured once from the first pose; the crouch height is half of it.
+        if (standingCapsuleHalfHeight_ <= 0.f) {
+            standingCapsuleHalfHeight_ = E::GetActorCharacterHalfHeight(actor_);
+        }
+        if ((curStateBits_ & coop::net::kStateBitCrouch) != 0 && standingCapsuleHalfHeight_ > 0.f) {
+            E::SetActorCharacterHalfHeight(actor_, standingCapsuleHalfHeight_ * 0.5f);
+        }
         // Footstep audio: the native accumulator lives in the puppet's suppressed BP tick, so the
         // coop layer strides the interpolated displacement and dispatches the game's own
         // lib_C::step (coop/player/puppet_footsteps.h). One StepDue verdict drives both the native

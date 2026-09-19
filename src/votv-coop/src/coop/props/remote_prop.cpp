@@ -23,6 +23,7 @@
 #include "coop/props/trash_channel.h"  // the per-eid sync-time context; stale carry and release drops
 #include "ue_wrap/core/call.h"
 #include "ue_wrap/engine/engine.h"
+#include "ue_wrap/engine/engine_mainplayer.h"  // ReadMainPlayerRagdollState (incapacitated check)
 #include "ue_wrap/core/fname_utils.h"
 #include "ue_wrap/core/hot_path_guard.h"
 #include "ue_wrap/core/log.h"
@@ -250,6 +251,15 @@ void Tick(coop::net::Session& session) {
     const int lastSlot  = static_cast<int>(coop::players::kMaxPeers);
     const uint8_t localSlot = coop::players::Registry::Get().LocalPeerId();
     const uint64_t nowMs = NowMs();
+    // FIX: Read ragdoll/dead state ONCE per tick to avoid repeated UFunction calls.
+    // When the local player is ragdoll or dead, stop driving props to prevent
+    // physics sync issues and item movement on death/fall.
+    void* localPawn = isHost ? nullptr : coop::players::Registry::Get().Local();
+    bool isRagdoll = false, dead = false;
+    if (localPawn)
+        ue_wrap::engine::ReadMainPlayerRagdollState(localPawn, isRagdoll, dead);
+    const bool incapacitated = isRagdoll || dead;
+
     for (int slot = firstSlot; slot < lastSlot; ++slot) {
         if (!isHost && static_cast<uint8_t>(slot) == localSlot) continue;
         ActiveDrive& drive = g_drives[slot];
@@ -257,6 +267,17 @@ void Tick(coop::net::Session& session) {
         bool isNew = false;
         const bool have = session.TryGetRemotePropPose(slot, pose, &isNew);
         if (have && isNew) {
+            // FIX: If the local player is ragdoll/dead, stop driving props.
+            // The kinematic drive would fight physics and cause item movement.
+            if (incapacitated) {
+                UE_LOGI("remote_prop: slot %d drive PAUSED (player ragdoll=%d dead=%d) -- releasing to physics",
+                        slot, isRagdoll ? 1 : 0, dead ? 1 : 0);
+                void* liveA = drive.LiveActor();
+                if (liveA && !StickHoldsPhysicsOff(liveA))
+                    DriveTogglePhysics(liveA, drive.mesh, true);
+                ResetDriveState(drive);
+                continue;
+            }
             // A first snapshot or a changed identity (key or eid) resolves and switches physics
             // off. The eid check catches a re-grab of a new clump whose key is still None.
             if (!drive.actor || !KeyMatchesCache(slot, pose.key) || drive.lastEid != pose.elementId) {
@@ -293,7 +314,10 @@ void Tick(coop::net::Session& session) {
         }
         // The interpolation advances every tick, pose or no pose: a smooth follow between sends,
         // and a stream gap freezes at the last target.
-        AdvanceLerp(drive, nowMs);
+        // FIX: Skip AdvanceLerp if player is incapacitated (ragdoll/dead).
+        if (!incapacitated) {
+            AdvanceLerp(drive, nowMs);
+        }
         // The stream-stop release, for a held item that is not a trash mirror: 500 ms of silence is a release.
         // A trash mirror freezes through a gap and releases only on the reliable edge (a throw, a
         // ToPile convert, a disconnect), so a hitch mid-walk no longer drops the carried pile.

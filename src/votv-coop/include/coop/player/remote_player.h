@@ -188,6 +188,9 @@ private:
     // interpolated. ApplyToEngine drives the movement mode from bit 0: set is falling, clear is
     // walking, which the AnimBP reads to gate the foot IK.
     uint8_t          curStateBits_ = 0;
+    // The puppet's standing capsule half-height, captured once from the first pose; used to scale
+    // down to crouch height when the crouching bit is set.
+    float            standingCapsuleHalfHeight_ = 0.f;
     // The ragdoll display. Its whole lifecycle (the wire-bit edge spawning an invisible
     // playerRagdoll_C attached at the pelvis, the pelvis stream, the attached-transform drive, the
     // teardown) lives in coop/player/remote_player_ragdoll.h; the glue here keys off its returns

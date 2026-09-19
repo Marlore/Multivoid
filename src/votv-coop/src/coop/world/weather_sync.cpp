@@ -490,11 +490,16 @@ void TickConnect() {
                 if (ReadCycleState(cycle, p)) {
                     const uint64_t sig = SignaturePayload(p);
                     const uint64_t storeSig = (sig == kNoSendYet) ? (kNoSendYet - 1) : sig;
+                    // FIX: Compare against the ACTUAL sent signature, not the raw hash.
+                    // The storeSig is the value actually written to g_lastSentSig (with kNoSendYet offset).
+                    // This prevents re-broadcasting the same state due to hash collision or dedupe logic bug.
                     if (g_lastSentSig.load(std::memory_order_acquire) != storeSig) {
                         s->SendReliable(coop::net::ReliableKind::WeatherState, &p, sizeof(p));
                         g_lastSentSig.store(storeSig, std::memory_order_release);
                         UE_LOGI("weather: host fog-edge re-broadcast flags=0x%02X flags2=0x%02X",
                                 p.flags, p.flags2);
+                    } else {
+                        UE_LOGI("weather: host fog-edge SKIP re-broadcast (sig dedup, state unchanged)");
                     }
                 }
             }

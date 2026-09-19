@@ -61,7 +61,10 @@ Element::~Element() {
     if (m_id == kInvalidId) return;
     // Static-destruction-order safety: skip Registry calls if the Registry has
     // already been torn down. The OS reclaims memory on process exit.
-    if (g_registryShuttingDown.load(std::memory_order_acquire)) return;
+    if (g_registryShuttingDown.load(std::memory_order_acquire)) {
+        m_id = kInvalidId;  // FIX: always reset id to prevent stale reads
+        return;
+    }
     // Drop our actor from the unified reverse before releasing the id.
     if (m_actor) Registry::Get().NoteActorRebind(m_id, m_actor, nullptr);
     // Mirrors borrowed the id from the host's allocation space; releasing the
@@ -69,6 +72,11 @@ Element::~Element() {
     // over a long session. UnregisterMirror just clears m_byId[id].
     if (m_mirror) Registry::Get().UnregisterMirror(m_id);
     else          Registry::Get().FreeId(m_id);
+    // FIX: Reset m_id to kInvalidId AFTER all Registry calls.
+    // This prevents a worker thread's SetActor from calling NoteActorRebind
+    // on an already-freed eid (the race: ~Element frees eid, SetActor reads
+    // m_id != kInvalidId, calls NoteActorRebind on stale eid).
+    m_id = kInvalidId;
 }
 
 }  // namespace coop::element

@@ -5,6 +5,11 @@
 
 #include "coop/props/prop_snapshot.h"
 
+#include "prop_element_tracker_detail.h"  // g_knownKeyedPropsMutex, g_knownKeyedProps (co-located private header)
+
+using coop::prop_element_tracker::g_knownKeyedPropsMutex;
+using coop::prop_element_tracker::g_knownKeyedProps;
+
 #include "coop/config/config.h"  // ReadEnv, the dedupe-bypass drill
 #include "coop/element/prop.h"
 #include "coop/element/registry.h"
@@ -450,8 +455,23 @@ void DrainChunk() {
 // this prop in its own in-flight drain dedupes it in RegisterPropMirror. `s` is host-validated and
 // `actor` live, by the caller. kindTag is a log prefix.
 static void BroadcastIncrementalPropSpawn_(coop::net::Session* s, void* actor, const char* kindTag) {
-    // The eid was minted by the seed walk that yielded this actor.
+    // CRITICAL FIX: Prevent duplicate PropSpawn broadcasts when props change state.
+    // If a prop already has a valid Prop Element, it was already synced and must not
+    // be re-broadcast. This prevents massive duplication when trash morphs or props
+    // change state (lying -> standing, etc.).
     const coop::element::ElementId eid = PT::GetPropElementIdForActor(actor);
+    if (eid != coop::element::kInvalidId && eid != 0) {
+        // Check if this prop was already broadcast by verifying it's in the known set.
+        // If it is, this is a state change, not a new spawn.
+        std::lock_guard<std::mutex> lk(g_knownKeyedPropsMutex);
+        if (g_knownKeyedProps.count(actor) > 0) {
+            UE_LOGI("snapshot: incremental PropSpawn SKIPPED for prop %p (eid=%u) - already tracked, state change not new spawn",
+                    actor, static_cast<unsigned>(eid));
+            return;
+        }
+    }
+    
+    // The eid was minted by the seed walk that yielded this actor.
     coop::net::PropSpawnPayload p{};
     // -1 and -1: liveness confirmed by the caller, and a mid-game express has no save-loaded twin
     // to stamp a match key for.

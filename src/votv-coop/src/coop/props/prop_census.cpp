@@ -454,6 +454,18 @@ void DrainReseedQueue() {
                 }
             }
         }
+        // CRITICAL FIX: Prevent duplicate PropSpawn broadcasts when props change state.
+        // If a prop already has a valid Prop Element, it was already synced and must not
+        // be re-broadcast. This prevents massive duplication when trash morphs or props
+        // change state (lying -> standing, etc.).
+        if (isNew) {
+            const coop::element::ElementId existingEid = GetPropElementIdForActor(it.obj);
+            if (existingEid != coop::element::kInvalidId && existingEid != 0) {
+                // Prop already has an element - this is a state change, not a new spawn.
+                // Skip broadcasting to prevent duplication.
+                isNew = false;
+            }
+        }
         // Phase 2, outside the mutex: the idempotent mark refresh for a keyed prop (index only on a
         // client) and the mint for a keyless pile.
         const std::wstring cls = R::ClassNameOf(it.obj);
