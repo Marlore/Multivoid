@@ -776,7 +776,8 @@ inline uint32_t NowStateTimeMs24() {
 //   speed        -- horizontal velocity magnitude (cm/s), the locomotion blend input.
 //   stateBits    -- bit 0 in air (the source's movement mode is falling; clears the puppet's foot
 //                   IK), bit 1 ragdolled and not dead (every ragdoll cause; the receiver toggles
-//                   ragdollMode and forceGetUp on the edges), bits 2..7 reserved.
+//                   ragdollMode and forceGetUp on the edges), bit 2 crouching (the source is in
+//                   crouch mode; the receiver scales the puppet's capsule height), bits 3..7 reserved.
 struct PoseSnapshot {
     float   x, y, z;
     float   yaw;
@@ -795,6 +796,7 @@ static_assert(sizeof(PoseSnapshot) == 32, "PoseSnapshot must be 32 bytes");
 // PoseSnapshot.stateBits flags. Single-byte field; flags assigned bit-by-bit.
 inline constexpr uint8_t kStateBitInAir   = 0x01;
 inline constexpr uint8_t kStateBitRagdoll = 0x02;  // the source is ragdolled (faint, manual, knock-out), not dead
+inline constexpr uint8_t kStateBitCrouch  = 0x04;  // the source is in crouch mode (capsule half-height halved)
 
 // The game's vital scalars (food, sleep, the default max health) top out at 100. health is
 // normalised by the peer's own max health before quantisation; food and sleep by this.
@@ -938,19 +940,28 @@ inline constexpr int kWorldActorPoseDatagramMax =
 // One carried, thrown or swept trash clump's pose in the TrashCarryPose batch, host-originated so
 // every client, the one who grabbed or swept it included, sees it move. Keyed by the trash eid; ctx
 // is the carry generation, and a pose whose ctx is not the currently adopted one is dropped.
+// When linVel/angVel are zero, the clump is kinematic (held in hand). When non-zero (after throw),
+// clients enable physics and apply the velocity so the clump flies/falls realistically.
 struct TrashClumpPoseSnapshot {
     uint32_t eid;              // 4  -- trash entity id (host-minted)
     float    x, y, z;          // 12 -- world cm
     float    pitch, yaw, roll; // 12 -- deg (NormalizeAxis'd by the sender)
+    float    linVelX;          // 4  -- linear velocity cm/s (0 = kinematic carry, non-zero = physics throw)
+    float    linVelY;
+    float    linVelZ;
+    float    angVelX;          // 4  -- angular velocity deg/s (usually 0 for clumps)
+    float    angVelY;
+    float    angVelZ;
     uint8_t  ctx;              // 1  -- carry-gen gate (same byte as PropPoseSnapshot.ctx)
     uint8_t  _pad[3];          // 3
 };
-static_assert(sizeof(TrashClumpPoseSnapshot) == 32, "TrashClumpPoseSnapshot must be 32 bytes");
+static_assert(sizeof(TrashClumpPoseSnapshot) == 56, "TrashClumpPoseSnapshot must be 56 bytes");
 
-// Max clump poses per TrashCarryPose datagram: 20 + 4 + 8*32 = 280 B, far under MTU. The host's
+// Max clump poses per TrashCarryPose datagram: 20 + 4 + 5*56 = 304 B, far under MTU. The host's
 // pending queue is merged by eid and drained a datagram's worth per send, so more clumps than fit
 // go out over the following sends. Reuses EntityPoseBatchHeader (generic count+pad; RULE 2).
-inline constexpr int kMaxTrashCarryBatchEntries = 8;
+// (56 bytes per entry after adding velocity fields; 5 per datagram instead of 8)
+inline constexpr int kMaxTrashCarryBatchEntries = 5;
 inline constexpr int kTrashCarryPoseDatagramMax =
     static_cast<int>(sizeof(PacketHeader) + sizeof(EntityPoseBatchHeader)) +
     kMaxTrashCarryBatchEntries * static_cast<int>(sizeof(TrashClumpPoseSnapshot));

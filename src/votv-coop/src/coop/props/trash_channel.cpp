@@ -105,6 +105,15 @@ std::string NarrowAscii(const std::wstring& w) {          // BP class names are 
     return s;
 }
 
+// CRITICAL FIX: Track last broadcast context per eid to prevent duplicate broadcasts.
+// When a pile/clump state changes rapidly (grab -> land -> grab), BroadcastConvert can fire
+// multiple times for the same eid. We track the last broadcast context and skip if unchanged.
+struct EidBroadcastState {
+    uint8_t lastCtx = 0;
+    uint8_t lastKind = 0;
+};
+std::unordered_map<uint32_t, EidBroadcastState> g_eidBroadcastState;
+
 // The single convert send primitive, which bumps the context. OnHostConvert calls it for the
 // open (the real grab) and the not-carrying land; the tick calls it for the settle commit (the
 // real land). `why` is a log tag.
@@ -112,7 +121,18 @@ uint8_t BroadcastConvert(coop::net::Session& s, coop::element::ElementId E, uint
                          const ue_wrap::FVector& loc, const ue_wrap::FRotator& rot,
                          const ue_wrap::FVector& scale, uint8_t chipType, const std::string& cls,
                          const char* why) {
-    const uint8_t ctx = Bump(static_cast<uint32_t>(E));
+    const uint32_t eid32 = static_cast<uint32_t>(E);
+    // Dedup: skip only if same kind and same context — a real state change always bumps ctx
+    // and flips kind (ToClump ↔ ToPile), so a true duplicate has identical kind+ctx.
+    auto& broadcastState = g_eidBroadcastState[eid32];
+    if (broadcastState.lastKind == kind && broadcastState.lastCtx > 0) {
+        UE_LOGI("[TRASH-CH] BROADCAST DEDUP eid=%u ctx=%u kind=%u -- skipping duplicate broadcast",
+                static_cast<unsigned>(eid32), static_cast<unsigned>(broadcastState.lastCtx),
+                static_cast<unsigned>(kind));
+        return broadcastState.lastCtx;  // Return existing context, don't bump
+    }
+    
+    const uint8_t ctx = Bump(eid32);
     coop::net::PropConvertPayload p{};
     p.oldEid = static_cast<uint32_t>(E);                  // bind model: oldEid == newEid == E
     p.newEid = static_cast<uint32_t>(E);
@@ -142,9 +162,13 @@ uint8_t BroadcastConvert(coop::net::Session& s, coop::element::ElementId E, uint
         }
     }
     s.SendReliable(coop::net::ReliableKind::PropConvert, &p, sizeof(p));
+    // Update broadcast state for dedup
+    broadcastState.lastCtx = ctx;
+    broadcastState.lastKind = kind;
+    
     UE_LOGI("[TRASH-CH] HOST BROADCAST %s eid=%u ctx=%u (%s) at (%.1f,%.1f,%.1f) variant=%u%s",
             kind == coop::net::propconvert_kind::kToClump ? "ToClump" : "ToPile",
-            static_cast<unsigned>(E), static_cast<unsigned>(ctx), why,
+            static_cast<unsigned>(eid32), static_cast<unsigned>(ctx), why,
             p.locX, p.locY, p.locZ, static_cast<unsigned>(chipType),
             p.hasMatchPos ? " [+saveTimeKey]" : "");
     return ctx;
@@ -486,9 +510,18 @@ void ForgetEid(coop::element::ElementId E) {
     const uint32_t eid = static_cast<uint32_t>(E);
     const size_t a = g_carry.erase(eid);
     const size_t b = g_settle.erase(eid);                 // erase BOTH (no short-circuit) so neither leaks
+    g_eidBroadcastState.erase(eid);                       // prevent false dedup on eid reuse
     if (a || b)
-        UE_LOGI("[TRASH-CH] HOST ForgetEid eid=%u -- carry latch + settle dropped (entity retired/destroyed)",
+        UE_LOGI("[TRASH-CH] HOST ForgetEid eid=%u -- carry latch + settle + broadcast state dropped (entity retired/destroyed)",
                 static_cast<unsigned>(eid));
+}
+
+// Close the carry latch for an eid (called from throw intent so the holder
+// can pick up trash again while the clump is flying).
+void CloseCarryForEid(uint32_t eid) {
+    const size_t a = g_carry.erase(eid);
+    if (a)
+        UE_LOGI("[TRASH-CH] CloseCarryForEid eid=%u -- carry latch closed (clump flying)", eid);
 }
 
 uint8_t CtxForEid(coop::element::ElementId E) {
@@ -535,6 +568,8 @@ void OnDisconnect() {
     g_clumpBirths.clear();  // drop unconsumed birth certificates
     g_carry.clear();    // drop all carry latches and settles
     g_settle.clear();
+    g_eidBroadcastState.clear();  // FIX: was leaking dedup state across disconnect/reconnect
+    ResetSmearHealState();  // FIX: clear 5s smear-heal debounce across reconnect
     ResetIntentState();  // HELD_BY + the client pending-grab/carry toggles (trash_grab_intent.cpp)
     g_tick = 0;
 }

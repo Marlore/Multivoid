@@ -27,4 +27,12 @@ void ClearHeldBy(uint32_t eid);
 // pending-grab / carry toggles.
 void ResetIntentState();
 
+// FIX: Clear smear heal debounce state across disconnect/reconnect.
+// Prevents stale 5s debounce from blocking legitimate incremental spawns after reconnect.
+void ResetSmearHealState();
+
+// Close the carry latch for an eid (called from throw intent so the holder
+// can pick up trash again while the clump is flying).
+void CloseCarryForEid(uint32_t eid);
+
 }  // namespace coop::trash_channel

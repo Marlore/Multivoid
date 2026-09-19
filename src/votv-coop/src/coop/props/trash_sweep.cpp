@@ -11,6 +11,7 @@
 #include "ue_wrap/core/reflection.h"
 #include "ue_wrap/core/types.h"
 #include "ue_wrap/engine/engine.h"
+#include "ue_wrap/engine/engine_attach.h"
 
 #include <cstdint>
 #include <vector>
@@ -116,6 +117,12 @@ void Tick(coop::net::Session& s, void* localPlayer) {
         snap.pitch = ue_wrap::NormalizeAxis(rot.Pitch);
         snap.yaw   = ue_wrap::NormalizeAxis(rot.Yaw);
         snap.roll  = ue_wrap::NormalizeAxis(rot.Roll);
+        // Broom-swept clumps are physics-driven from the start, so include velocity
+        // Use GetActorRootPhysicsVelocity (reads from root primitive component, not AActor::GetVelocity)
+        ue_wrap::FVector physVel{};
+        ue_wrap::engine::GetActorRootPhysicsVelocity(r.clump, physVel, physVel);
+        snap.linVelX = physVel.X; snap.linVelY = physVel.Y; snap.linVelZ = physVel.Z;
+        snap.angVelX = 0.f; snap.angVelY = 0.f; snap.angVelZ = 0.f;
         snap.ctx   = coop::trash_channel::CtxForEid(static_cast<coop::element::ElementId>(r.eid));
         s.PublishTrashCarryPose(snap, /*ahead=*/false);
         if (turn == coop::net::PoseTurn::Join) ++joined;

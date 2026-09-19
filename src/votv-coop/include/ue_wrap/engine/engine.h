@@ -121,6 +121,11 @@ FRotator GetComponentWorldRotation(void* component);
 // moving the root re-bases the child's world transform. Game thread.
 bool SetComponentWorldRotation(void* component, const FRotator& rotation);
 
+// USceneComponent::K2_SetRelativeRotation (bTeleport=true). Sets the component's RELATIVE rotation
+// (offset from parent's world rotation). Critical for trash piles where the StaticMesh component's
+// relative rotation holds the random roll from UserConstructionScript. Game thread.
+bool SetComponentRelativeRotation(void* component, const FRotator& rotation);
+
 // AActor::SetActorTickEnabled; a remote pawn must not run the local player's per-frame BP
 // EventTick, which re-applies view and post-process to the shared screen. Game thread.
 bool SetActorTickEnabled(void* actor, bool enabled);
@@ -157,6 +162,10 @@ void LogClassProperties(const wchar_t* className);
 // ACharacter's capsule half-height (UCapsuleComponent::CapsuleHalfHeight); 0.f if none. Game
 // thread.
 float GetActorCharacterHalfHeight(void* mainPlayerPawn);
+
+// Set ACharacter's capsule half-height (UCapsuleComponent::CapsuleHalfHeight); returns false if
+// capsule is null. Game thread only.
+bool SetActorCharacterHalfHeight(void* mainPlayerPawn, float halfHeight);
 
 // A long-lived WorldContextObject for the deferred-spawn pair: the GameInstance, else the World.
 void* GetWorldContext();

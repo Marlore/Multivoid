@@ -9,6 +9,8 @@
 #include "coop/player/remote_player.h"
 #include "coop/props/trash_channel.h"     // IsCarrying / HasPendingSettle / CtxForEid (carry latch + stamp)
 #include "ue_wrap/engine/engine.h"          // SetActorLocation / GetActorLocation / GetActorRotation
+#include "ue_wrap/engine/engine_attach.h"   // GetActorRootPhysicsVelocity (root primitive component)
+#include "ue_wrap/engine/engine_mainplayer.h"  // ReadMainPlayerRagdollState (incapacitated check)
 #include "ue_wrap/core/log.h"
 #include "ue_wrap/core/reflection.h"      // IsLiveByIndex / InternalIndexOf
 #include "ue_wrap/core/types.h"           // FVector / FRotator / NormalizeAxis
@@ -96,10 +98,17 @@ void Tick(coop::net::Session& s) {
         const coop::element::ElementId E = static_cast<coop::element::ElementId>(it->eid);
         // Guard 1 (FIRST): the carry latch closed = a re-pile land COMMIT (TickCarry ran BEFORE this in
         // TickGameplay + already cleared g_heldBy). The clump became a pile -> stop following, no release.
+        // EXCEPTION: if flying=true, the carry latch was closed by a throw (CloseCarryForEid), but we
+        // still need to stream the flight pose until the clump re-piles. Don't erase in that case.
         if (!coop::trash_channel::IsCarrying(E)) {
-            UE_LOGI("[PUPPET-DRIVE] eid=%u slot=%u -- carry latch closed (landed) -> drive OFF", it->eid, it->slot);
-            it = g_held.erase(it);
-            continue;
+            if (!it->flying) {
+                // Not flying and not carrying -> clump landed (ToPile convert) -> stop drive
+                UE_LOGI("[PUPPET-DRIVE] eid=%u slot=%u -- carry latch closed (landed) -> drive OFF", it->eid, it->slot);
+                it = g_held.erase(it);
+                continue;
+            }
+            // Flying but not carrying -> carry latch closed by throw, but flight pose still needs streaming
+            // Keep the entry alive and continue streaming
         }
         // Guard 2: the clump still live? (cross-tick cached pointer -> IsLiveByIndex, never bare IsLive.) The
         // re-pile DESTROYS the clump (K2_DestroyActor(self)) while a land-settle is pending (g_carry still
@@ -123,6 +132,29 @@ void Tick(coop::net::Session& s) {
             coop::RemotePlayer* rp = coop::players::Registry::Get().Puppet(it->slot);
             if (!rp || !rp->valid()) {
                 UE_LOGI("[PUPPET-DRIVE] eid=%u slot=%u -- puppet gone -> drive OFF + release hold", it->eid, it->slot);
+                coop::trash_channel::ReleaseClientHold(s, E);
+                it = g_held.erase(it);
+                continue;
+            }
+            // FIX: Check if the puppet's owner is ragdoll/dead. If so, stop driving and release to physics.
+            // This prevents physics sync issues when the local player falls/dies while holding a clump.
+            void* ownerPawn = nullptr;
+            if (it->slot == 0) {
+                // Slot 0 = local player
+                ownerPawn = coop::players::Registry::Get().Local();
+            } else {
+                // Other slots = puppet
+                if (auto* puppet = coop::players::Registry::Get().Puppet(it->slot))
+                    ownerPawn = puppet->GetActor();
+            }
+            bool ownerRagdoll = false, ownerDead = false;
+            if (ownerPawn)
+                ue_wrap::engine::ReadMainPlayerRagdollState(ownerPawn, ownerRagdoll, ownerDead);
+            if (ownerRagdoll || ownerDead) {
+                UE_LOGI("[PUPPET-DRIVE] eid=%u slot=%u -- owner ragdoll=%d dead=%d -> releasing to physics",
+                        it->eid, it->slot, ownerRagdoll ? 1 : 0, ownerDead ? 1 : 0);
+                // Re-enable physics on the clump so it falls naturally
+                ue_wrap::engine::SetActorSimulatePhysics(it->clump, true);
                 coop::trash_channel::ReleaseClientHold(s, E);
                 it = g_held.erase(it);
                 continue;
@@ -169,6 +201,7 @@ void Tick(coop::net::Session& s) {
         // can't echo to the grabber; a client drives only slot 0). eid+ctx keyed -> the receiver's per-eid
         // ActiveDrive interp; ctx is the carry generation (stale-pose guard on the client). A clump a
         // player moved, carried or thrown, goes ahead of the ones a broom set rolling.
+        // When flying, also stream the physics velocity so clients can enable physics and see the throw arc.
         if (s.TrashCarryPoseTurn(it->eid, /*ahead=*/true) != coop::net::PoseTurn::Wait) {
             const ue_wrap::FVector  loc = E::GetActorLocation(it->clump);
             const ue_wrap::FRotator rot = E::GetActorRotation(it->clump);
@@ -178,11 +211,42 @@ void Tick(coop::net::Session& s) {
             snap.pitch = ue_wrap::NormalizeAxis(rot.Pitch);
             snap.yaw   = ue_wrap::NormalizeAxis(rot.Yaw);
             snap.roll  = ue_wrap::NormalizeAxis(rot.Roll);
+            // When flying (after throw), include physics velocity so clients enable physics
+            // and see the realistic throw arc. When carried (kinematic), velocity is zero.
+            // NOTE: GetActorVelocity returns zero for non-physical root components (USceneComponent).
+            // Use GetActorRootPhysicsVelocity which reads from UPrimitiveComponent::GetPhysicsLinearVelocity.
+            if (it->flying) {
+                ue_wrap::FVector physVel{};
+                bool velOk = ue_wrap::engine::GetActorRootPhysicsVelocity(it->clump, physVel, physVel);
+                snap.linVelX = physVel.X; snap.linVelY = physVel.Y; snap.linVelZ = physVel.Z;
+                // Angular velocity usually zero for clumps, but read it for completeness
+                snap.angVelX = 0.f; snap.angVelY = 0.f; snap.angVelZ = 0.f;
+                // DEBUG: Log first 5 frames after throw to verify velocity is non-zero
+                static uint32_t s_lastDebugEid = 0;
+                static int s_debugCount = 0;
+                if (it->eid != s_lastDebugEid) {
+                    s_lastDebugEid = it->eid;
+                    s_debugCount = 0;
+                }
+                if (s_debugCount < 5) {
+                    float velMag = std::sqrt(physVel.X*physVel.X + physVel.Y*physVel.Y + physVel.Z*physVel.Z);
+                    UE_LOGI("[THROW-DEBUG] HOST eid=%u flying=true velOk=%d vel=(%.0f,%.0f,%.0f) mag=%.1f ctx=%u",
+                            it->eid, velOk ? 1 : 0,
+                            physVel.X, physVel.Y, physVel.Z, velMag,
+                            static_cast<unsigned>(coop::trash_channel::CtxForEid(E)));
+                    s_debugCount++;
+                }
+            } else {
+                // Kinematic carry: zero velocity (clients keep physics disabled)
+                snap.linVelX = 0.f; snap.linVelY = 0.f; snap.linVelZ = 0.f;
+                snap.angVelX = 0.f; snap.angVelY = 0.f; snap.angVelZ = 0.f;
+            }
             snap.ctx   = coop::trash_channel::CtxForEid(E);
             s.PublishTrashCarryPose(snap, /*ahead=*/true);
             if ((sTick % 60) == 0)
-                UE_LOGI("[TRASH-CARRY] HOST PUBLISH eid=%u slot=%u %s -> (%.1f,%.1f,%.1f) ctx=%u maxDriftCm=%.2f",
+                UE_LOGI("[TRASH-CARRY] HOST PUBLISH eid=%u slot=%u %s -> (%.1f,%.1f,%.1f) vel=(%.0f,%.0f,%.0f) ctx=%u maxDriftCm=%.2f",
                         it->eid, it->slot, it->flying ? "FLIGHT" : "carry", loc.X, loc.Y, loc.Z,
+                        snap.linVelX, snap.linVelY, snap.linVelZ,
                         static_cast<unsigned>(snap.ctx), it->maxDriftCm);
         }
         ++it;
@@ -211,6 +275,19 @@ void OnPeerLeft(uint8_t slot) {
 
 void OnDisconnect() {
     g_held.clear();
+}
+
+void ClearPuppetCarryDriveForEid(coop::element::ElementId eid) {
+    const uint32_t e = static_cast<uint32_t>(eid);
+    for (auto it = g_held.begin(); it != g_held.end(); ) {
+        if (it->eid == e) {
+            UE_LOGI("[PUPPET-DRIVE] ClearPuppetCarryDriveForEid eid=%u slot=%u -- clearing flying entry after land",
+                    it->eid, it->slot);
+            it = g_held.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 }  // namespace coop::puppet_carry_drive

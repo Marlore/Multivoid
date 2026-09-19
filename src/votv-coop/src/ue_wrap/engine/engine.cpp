@@ -468,6 +468,16 @@ float GetActorCharacterHalfHeight(void* mainPlayerPawn) {
         reinterpret_cast<uint8_t*>(capsule) + P::off::UCapsuleComponent_CapsuleHalfHeight);
 }
 
+bool SetActorCharacterHalfHeight(void* mainPlayerPawn, float halfHeight) {
+    if (!mainPlayerPawn) return false;
+    void* capsule = *reinterpret_cast<void**>(
+        reinterpret_cast<uint8_t*>(mainPlayerPawn) + P::off::ACharacter_CapsuleComponent);
+    if (!capsule) return false;
+    *reinterpret_cast<float*>(
+        reinterpret_cast<uint8_t*>(capsule) + P::off::UCapsuleComponent_CapsuleHalfHeight) = halfHeight;
+    return true;
+}
+
 
 FVector GetActorForwardVector(void* actor) {
     FVector fwd;
@@ -560,6 +570,25 @@ bool SetComponentWorldRotation(void* component, const FRotator& rotation) {
     f.SetRaw(L"NewRotation", &rotation, sizeof(rotation));
     f.Set<bool>(L"bSweep", false);
     f.Set<bool>(L"bTeleport", true);  // K2_SetWorldRotation's FHitResult& out-param frame space is allocated by ParamFrame
+    return Call(component, f);
+}
+
+bool SetComponentRelativeRotation(void* component, const FRotator& rotation) {
+    if (!component || !R::IsLive(component)) return false;
+    // USceneComponent::K2_SetRelativeRotation
+    static void* fn = nullptr;
+    if (!fn) {
+        if (void* sc = R::FindClass(L"SceneComponent"))
+            fn = R::FindFunction(sc, L"K2_SetRelativeRotation");
+    }
+    if (!fn) {
+        UE_LOGW("engine: SetComponentRelativeRotation -- K2_SetRelativeRotation not found on SceneComponent");
+        return false;
+    }
+    ParamFrame f(fn);
+    f.SetRaw(L"NewRotation", &rotation, sizeof(rotation));
+    f.Set<bool>(L"bSweep", false);
+    f.Set<bool>(L"bTeleport", true);
     return Call(component, f);
 }
 

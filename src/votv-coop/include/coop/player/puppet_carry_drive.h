@@ -59,4 +59,8 @@ void OnPeerLeft(uint8_t slot);
 // HOST: full reset (net disconnect). Game thread.
 void OnDisconnect();
 
+// HOST: clear a specific eid's entry from g_held (called by trash_clump_pose_stream::ClearDriveForEid
+// when the clump lands/retires). This removes the flying=true entry that persists after a throw.
+void ClearPuppetCarryDriveForEid(coop::element::ElementId eid);
+
 }  // namespace coop::puppet_carry_drive
